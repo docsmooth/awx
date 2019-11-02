@@ -18,7 +18,7 @@ import OrganizationListItem from './OrganizationListItem';
 
 const QS_CONFIG = getQSConfig('organization', {
   page: 1,
-  page_size: 5,
+  page_size: 20,
   order_by: 'name',
 });
 
@@ -142,7 +142,8 @@ class OrganizationsList extends Component {
 
     const canAdd =
       actions && Object.prototype.hasOwnProperty.call(actions, 'POST');
-    const isAllSelected = selected.length === organizations.length;
+    const isAllSelected =
+      selected.length === organizations.length && selected.length > 0;
 
     return (
       <Fragment>

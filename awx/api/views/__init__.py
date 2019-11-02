@@ -102,7 +102,7 @@ from awx.main.scheduler.dag_workflow import WorkflowDAG
 from awx.api.views.mixin import (
     ControlledByScmMixin, InstanceGroupMembershipMixin,
     OrganizationCountsMixin, RelatedJobsPreventDeleteMixin,
-    UnifiedJobDeletionMixin,
+    UnifiedJobDeletionMixin, NoTruncateMixin,
 )
 from awx.api.views.organization import ( # noqa
     OrganizationList,
@@ -119,6 +119,7 @@ from awx.api.views.organization import ( # noqa
     OrganizationNotificationTemplatesErrorList,
     OrganizationNotificationTemplatesStartedList,
     OrganizationNotificationTemplatesSuccessList,
+    OrganizationNotificationTemplatesApprovalList,
     OrganizationInstanceGroupsList,
     OrganizationAccessList,
     OrganizationObjectRolesList,
@@ -148,6 +149,11 @@ from awx.api.views.root import ( # noqa
     ApiV2PingView,
     ApiV2ConfigView,
     ApiV2SubscriptionView,
+)
+from awx.api.views.webhooks import ( # noqa
+    WebhookKeyView,
+    GithubWebhookReceiver,
+    GitlabWebhookReceiver,
 )
 
 
@@ -377,6 +383,13 @@ class InstanceGroupDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAP
     serializer_class = serializers.InstanceGroupSerializer
     permission_classes = (InstanceGroupTowerPermission,)
 
+    def update_raw_data(self, data):
+        if self.get_object().is_containerized:
+            data.pop('policy_instance_percentage', None)
+            data.pop('policy_instance_minimum', None)
+            data.pop('policy_instance_list', None)
+        return super(InstanceGroupDetail, self).update_raw_data(data)
+
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
         if instance.controller is not None:
@@ -562,6 +575,7 @@ class TeamUsersList(BaseUsersList):
     serializer_class = serializers.UserSerializer
     parent_model = models.Team
     relationship = 'member_role.members'
+    ordering = ('username',)
 
 
 class TeamRolesList(SubListAttachDetachAPIView):
@@ -898,6 +912,7 @@ class UserList(ListCreateAPIView):
     model = models.User
     serializer_class = serializers.UserSerializer
     permission_classes = (UserPermission,)
+    ordering = ('username',)
 
 
 class UserMeList(ListAPIView):
@@ -905,6 +920,7 @@ class UserMeList(ListAPIView):
     model = models.User
     serializer_class = serializers.UserSerializer
     name = _('Me')
+    ordering = ('username',)
 
     def get_queryset(self):
         return self.model.objects.filter(pk=self.request.user.pk)
@@ -1248,6 +1264,7 @@ class CredentialOwnerUsersList(SubListAPIView):
     serializer_class = serializers.UserSerializer
     parent_model = models.Credential
     relationship = 'admin_role.members'
+    ordering = ('username',)
 
 
 class CredentialOwnerTeamsList(SubListAPIView):
@@ -2130,12 +2147,21 @@ class InventorySourceHostsList(HostRelatedSearchMixin, SubListDestroyAPIView):
     def perform_list_destroy(self, instance_list):
         inv_source = self.get_parent_object()
         with ignore_inventory_computed_fields():
-            # Activity stream doesn't record disassociation here anyway
-            # no signals-related reason to not bulk-delete
-            models.Host.groups.through.objects.filter(
-                host__inventory_sources=inv_source
-            ).delete()
-            r = super(InventorySourceHostsList, self).perform_list_destroy(instance_list)
+            if not settings.ACTIVITY_STREAM_ENABLED_FOR_INVENTORY_SYNC:
+                from awx.main.signals import disable_activity_stream
+                with disable_activity_stream():
+                    # job host summary deletion necessary to avoid deadlock
+                    models.JobHostSummary.objects.filter(host__inventory_sources=inv_source).update(host=None)
+                    models.Host.objects.filter(inventory_sources=inv_source).delete()
+                    r = super(InventorySourceHostsList, self).perform_list_destroy([])
+            else:
+                # Advance delete of group-host memberships to prevent deadlock
+                # Activity stream doesn't record disassociation here anyway
+                # no signals-related reason to not bulk-delete
+                models.Host.groups.through.objects.filter(
+                    host__inventory_sources=inv_source
+                ).delete()
+                r = super(InventorySourceHostsList, self).perform_list_destroy(instance_list)
         update_inventory_computed_fields.delay(inv_source.inventory_id, True)
         return r
 
@@ -2151,11 +2177,18 @@ class InventorySourceGroupsList(SubListDestroyAPIView):
     def perform_list_destroy(self, instance_list):
         inv_source = self.get_parent_object()
         with ignore_inventory_computed_fields():
-            # Same arguments for bulk delete as with host list
-            models.Group.hosts.through.objects.filter(
-                group__inventory_sources=inv_source
-            ).delete()
-            r = super(InventorySourceGroupsList, self).perform_list_destroy(instance_list)
+            if not settings.ACTIVITY_STREAM_ENABLED_FOR_INVENTORY_SYNC:
+                from awx.main.signals import disable_activity_stream
+                with disable_activity_stream():
+                    models.Group.objects.filter(inventory_sources=inv_source).delete()
+                    r = super(InventorySourceGroupsList, self).perform_list_destroy([])
+            else:
+                # Advance delete of group-host memberships to prevent deadlock
+                # Same arguments for bulk delete as with host list
+                models.Group.hosts.through.objects.filter(
+                    group__inventory_sources=inv_source
+                ).delete()
+                r = super(InventorySourceGroupsList, self).perform_list_destroy(instance_list)
         update_inventory_computed_fields.delay(inv_source.inventory_id, True)
         return r
 
@@ -2562,10 +2595,34 @@ class JobTemplateSurveySpec(GenericAPIView):
                         return Response(dict(error=_(
                             "The {min_or_max} limit in survey question {idx} expected to be integer."
                         ).format(min_or_max=key, **context)))
-            if qtype in ['multiplechoice', 'multiselect'] and 'choices' not in survey_item:
-                return Response(dict(error=_(
-                    "Survey question {idx} of type {survey_item[type]} must specify choices.".format(**context)
-                )))
+            # if it's a multiselect or multiple choice, it must have coices listed
+            # choices and defualts must come in as strings seperated by /n characters.
+            if qtype == 'multiselect' or qtype == 'multiplechoice':
+                if 'choices' in survey_item:
+                    if isinstance(survey_item['choices'], str):
+                        survey_item['choices'] = '\n'.join(choice for choice in survey_item['choices'].splitlines() if choice.strip() != '')
+                else:
+                    return Response(dict(error=_(
+                        "Survey question {idx} of type {survey_item[type]} must specify choices.".format(**context)
+                    )))
+                # If there is a default string split it out removing extra /n characters.
+                # Note: There can still be extra newline characters added in the API, these are sanitized out using .strip()
+                if 'default' in survey_item:
+                    if isinstance(survey_item['default'], str):
+                        survey_item['default'] = '\n'.join(choice for choice in survey_item['default'].splitlines() if choice.strip() != '')
+                        list_of_defaults = survey_item['default'].splitlines()
+                    else:
+                        list_of_defaults = survey_item['default']
+                    if qtype == 'multiplechoice':
+                        # Multiplechoice types should only have 1 default.
+                        if len(list_of_defaults) > 1:
+                            return Response(dict(error=_(
+                                "Multiple Choice (Single Select) can only have one default value.".format(**context)
+                            )))
+                    if any(item not in survey_item['choices'] for item in list_of_defaults):
+                        return Response(dict(error=_(
+                            "Default choice must be answered from the choices listed.".format(**context)
+                        )))
 
             # Process encryption substitution
             if ("default" in survey_item and isinstance(survey_item['default'], str) and
@@ -3288,6 +3345,11 @@ class WorkflowJobTemplateNotificationTemplatesSuccessList(WorkflowJobTemplateNot
     relationship = 'notification_templates_success'
 
 
+class WorkflowJobTemplateNotificationTemplatesApprovalList(WorkflowJobTemplateNotificationTemplatesAnyList):
+
+    relationship = 'notification_templates_approvals'
+
+
 class WorkflowJobTemplateAccessList(ResourceAccessList):
 
     model = models.User # needs to be User for AccessLists's
@@ -3372,6 +3434,11 @@ class WorkflowJobNotificationsList(SubListAPIView):
     parent_model = models.WorkflowJob
     relationship = 'notifications'
     search_fields = ('subject', 'notification_type', 'body',)
+
+    def get_sublist_queryset(self, parent):
+        return self.model.objects.filter(Q(unifiedjob_notifications=parent) |
+                                         Q(unifiedjob_notifications__unified_job_node__workflow_job=parent,
+                                         unifiedjob_notifications__workflowapproval__isnull=False)).distinct()
 
 
 class WorkflowJobActivityStreamList(SubListAPIView):
@@ -3722,7 +3789,7 @@ class JobHostSummaryDetail(RetrieveAPIView):
     serializer_class = serializers.JobHostSummarySerializer
 
 
-class JobEventList(ListAPIView):
+class JobEventList(NoTruncateMixin, ListAPIView):
 
     model = models.JobEvent
     serializer_class = serializers.JobEventSerializer
@@ -3734,8 +3801,13 @@ class JobEventDetail(RetrieveAPIView):
     model = models.JobEvent
     serializer_class = serializers.JobEventSerializer
 
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context.update(no_truncate=True)
+        return context
 
-class JobEventChildrenList(SubListAPIView):
+
+class JobEventChildrenList(NoTruncateMixin, SubListAPIView):
 
     model = models.JobEvent
     serializer_class = serializers.JobEventSerializer
@@ -3760,7 +3832,7 @@ class JobEventHostsList(HostRelatedSearchMixin, SubListAPIView):
     name = _('Job Event Hosts List')
 
 
-class BaseJobEventsList(SubListAPIView):
+class BaseJobEventsList(NoTruncateMixin, SubListAPIView):
 
     model = models.JobEvent
     serializer_class = serializers.JobEventSerializer
@@ -3956,7 +4028,7 @@ class AdHocCommandRelaunch(GenericAPIView):
             return Response(data, status=status.HTTP_201_CREATED, headers=headers)
 
 
-class AdHocCommandEventList(ListAPIView):
+class AdHocCommandEventList(NoTruncateMixin, ListAPIView):
 
     model = models.AdHocCommandEvent
     serializer_class = serializers.AdHocCommandEventSerializer
@@ -3968,8 +4040,13 @@ class AdHocCommandEventDetail(RetrieveAPIView):
     model = models.AdHocCommandEvent
     serializer_class = serializers.AdHocCommandEventSerializer
 
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context.update(no_truncate=True)
+        return context
 
-class BaseAdHocCommandEventsList(SubListAPIView):
+
+class BaseAdHocCommandEventsList(NoTruncateMixin, SubListAPIView):
 
     model = models.AdHocCommandEvent
     serializer_class = serializers.AdHocCommandEventSerializer
@@ -4235,8 +4312,15 @@ class NotificationTemplateTest(GenericAPIView):
 
     def post(self, request, *args, **kwargs):
         obj = self.get_object()
-        notification = obj.generate_notification("Tower Notification Test {} {}".format(obj.id, settings.TOWER_URL_BASE),
-                                                 {"body": "Ansible Tower Test Notification {} {}".format(obj.id, settings.TOWER_URL_BASE)})
+        msg = "Tower Notification Test {} {}".format(obj.id, settings.TOWER_URL_BASE)
+        if obj.notification_type in ('email', 'pagerduty'):
+            body = "Ansible Tower Test Notification {} {}".format(obj.id, settings.TOWER_URL_BASE)
+        elif obj.notification_type == 'webhook':
+            body = '{{"body": "Ansible Tower Test Notification {} {}"}}'.format(obj.id, settings.TOWER_URL_BASE)
+        else:
+            body = {"body": "Ansible Tower Test Notification {} {}".format(obj.id, settings.TOWER_URL_BASE)}
+        notification = obj.generate_notification(msg, body)
+
         if not notification:
             return Response({}, status=status.HTTP_400_BAD_REQUEST)
         else:

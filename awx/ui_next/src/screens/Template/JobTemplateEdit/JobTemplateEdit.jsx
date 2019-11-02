@@ -6,6 +6,7 @@ import ContentError from '@components/ContentError';
 import ContentLoading from '@components/ContentLoading';
 import { JobTemplatesAPI, ProjectsAPI } from '@api';
 import { JobTemplate } from '@types';
+import { getAddedAndRemoved } from '@util/lists';
 import JobTemplateForm from '../shared/JobTemplateForm';
 
 class JobTemplateEdit extends Component {
@@ -104,10 +105,11 @@ class JobTemplateEdit extends Component {
   async handleSubmit(values) {
     const { template, history } = this.props;
     const {
-      newLabels,
-      removedLabels,
-      addedInstanceGroups,
-      removedInstanceGroups,
+      labels,
+      organizationId,
+      instanceGroups,
+      initialInstanceGroups,
+      credentials,
       ...remainingValues
     } = values;
 
@@ -115,8 +117,9 @@ class JobTemplateEdit extends Component {
     try {
       await JobTemplatesAPI.update(template.id, remainingValues);
       await Promise.all([
-        this.submitLabels(newLabels, removedLabels),
-        this.submitInstanceGroups(addedInstanceGroups, removedInstanceGroups),
+        this.submitLabels(labels, organizationId),
+        this.submitInstanceGroups(instanceGroups, initialInstanceGroups),
+        this.submitCredentials(credentials),
       ]);
       history.push(this.detailsUrl);
     } catch (formSubmitError) {
@@ -124,17 +127,23 @@ class JobTemplateEdit extends Component {
     }
   }
 
-  async submitLabels(newLabels = [], removedLabels = []) {
+  async submitLabels(labels = [], organizationId) {
     const { template } = this.props;
-    const disassociationPromises = removedLabels.map(label =>
+    const { added, removed } = getAddedAndRemoved(
+      template.summary_fields.labels.results,
+      labels
+    );
+    const disassociationPromises = removed.map(label =>
       JobTemplatesAPI.disassociateLabel(template.id, label)
     );
-    const associationPromises = newLabels
-      .filter(label => !label.organization)
+    const associationPromises = added
+      .filter(label => !label.isNew)
       .map(label => JobTemplatesAPI.associateLabel(template.id, label));
-    const creationPromises = newLabels
-      .filter(label => label.organization)
-      .map(label => JobTemplatesAPI.generateLabel(template.id, label));
+    const creationPromises = added
+      .filter(label => label.isNew)
+      .map(label =>
+        JobTemplatesAPI.generateLabel(template.id, label, organizationId)
+      );
 
     const results = await Promise.all([
       ...disassociationPromises,
@@ -144,15 +153,33 @@ class JobTemplateEdit extends Component {
     return results;
   }
 
-  async submitInstanceGroups(addedGroups, removedGroups) {
+  async submitInstanceGroups(groups, initialGroups) {
     const { template } = this.props;
-    const associatePromises = addedGroups.map(group =>
-      JobTemplatesAPI.associateInstanceGroup(template.id, group.id)
-    );
-    const disassociatePromises = removedGroups.map(group =>
+    const { added, removed } = getAddedAndRemoved(initialGroups, groups);
+    const disassociatePromises = await removed.map(group =>
       JobTemplatesAPI.disassociateInstanceGroup(template.id, group.id)
     );
-    return Promise.all([...associatePromises, ...disassociatePromises]);
+    const associatePromises = await added.map(group =>
+      JobTemplatesAPI.associateInstanceGroup(template.id, group.id)
+    );
+    return Promise.all([...disassociatePromises, ...associatePromises]);
+  }
+
+  async submitCredentials(newCredentials) {
+    const { template } = this.props;
+    const { added, removed } = getAddedAndRemoved(
+      template.summary_fields.credentials,
+      newCredentials
+    );
+    const disassociateCredentials = removed.map(cred =>
+      JobTemplatesAPI.disassociateCredentials(template.id, cred.id)
+    );
+    const disassociatePromise = await Promise.all(disassociateCredentials);
+    const associateCredentials = added.map(cred =>
+      JobTemplatesAPI.associateCredentials(template.id, cred.id)
+    );
+    const associatePromise = Promise.all(associateCredentials);
+    return Promise.all([disassociatePromise, associatePromise]);
   }
 
   handleCancel() {
@@ -171,11 +198,19 @@ class JobTemplateEdit extends Component {
     const canEdit = template.summary_fields.user_capabilities.edit;
 
     if (hasContentLoading) {
-      return <ContentLoading />;
+      return (
+        <CardBody>
+          <ContentLoading />
+        </CardBody>
+      );
     }
 
     if (contentError) {
-      return <ContentError error={contentError} />;
+      return (
+        <CardBody>
+          <ContentError error={contentError} />
+        </CardBody>
+      );
     }
 
     if (!canEdit) {
