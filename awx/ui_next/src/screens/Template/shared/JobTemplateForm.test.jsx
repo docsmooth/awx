@@ -67,6 +67,14 @@ describe('<JobTemplateForm />', () => {
     { id: 5, kind: 'Machine', name: 'Cred 5', url: 'www.google.com' },
   ];
 
+  beforeAll(() => {
+    jest.setTimeout(5000 * 4);
+  });
+
+  afterAll(() => {
+    jest.setTimeout(5000);
+  });
+
   beforeEach(() => {
     LabelsAPI.read.mockReturnValue({
       data: mockData.summary_fields.labels,
@@ -149,10 +157,12 @@ describe('<JobTemplateForm />', () => {
       target: { value: 'new baz type', name: 'playbook' },
     });
     expect(form.state('values').playbook).toEqual('new baz type');
-    wrapper
-      .find('CredentialChip')
-      .at(0)
-      .prop('onClick')();
+    await act(async () => {
+      wrapper
+        .find('CredentialChip')
+        .at(0)
+        .prop('onClick')();
+    });
     expect(form.state('values').credentials).toEqual([
       { id: 2, kind: 'ssh', name: 'Bar' },
     ]);
@@ -172,7 +182,9 @@ describe('<JobTemplateForm />', () => {
     });
     await waitForElement(wrapper, 'EmptyStateBody', el => el.length === 0);
     expect(handleSubmit).not.toHaveBeenCalled();
-    wrapper.find('button[aria-label="Save"]').simulate('click');
+    await act(async () => {
+      wrapper.find('button[aria-label="Save"]').simulate('click');
+    });
     await sleep(1);
     expect(handleSubmit).toBeCalled();
   });

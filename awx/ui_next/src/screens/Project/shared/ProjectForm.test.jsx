@@ -7,7 +7,7 @@ import { CredentialTypesAPI, ProjectsAPI } from '@api';
 
 jest.mock('@api');
 
-describe('<ProjectAdd />', () => {
+describe('<ProjectForm />', () => {
   let wrapper;
   const mockData = {
     name: 'foo',
@@ -21,6 +21,14 @@ describe('<ProjectAdd />', () => {
     scm_update_cache_timeout: 3,
     allow_override: false,
     custom_virtualenv: '/venv/custom-env',
+    summary_fields: {
+      credential: {
+        id: 100,
+        credential_type_id: 4,
+        kind: 'scm',
+        name: 'Foo',
+      },
+    },
   };
 
   const projectOptionsResolve = {
@@ -207,6 +215,59 @@ describe('<ProjectAdd />', () => {
       });
     });
     expect(formik.state.values.credential).toEqual(123);
+  });
+
+  test('manual subform should display expected fields', async () => {
+    const config = {
+      project_local_paths: ['foobar', 'qux'],
+      project_base_dir: 'dir/foo/bar',
+    };
+    await act(async () => {
+      wrapper = mountWithContexts(
+        <ProjectForm
+          handleSubmit={jest.fn()}
+          handleCancel={jest.fn()}
+          project={{ scm_type: '', local_path: '/_foo__bar' }}
+        />,
+        {
+          context: { config },
+        }
+      );
+    });
+    await waitForElement(wrapper, 'ContentLoading', el => el.length === 0);
+    const playbookDirectorySelect = wrapper.find(
+      'FormGroup[label="Playbook Directory"] FormSelect'
+    );
+    await act(async () => {
+      playbookDirectorySelect
+        .props()
+        .onChange('foobar', { target: { name: 'foobar' } });
+    });
+    expect(wrapper.find('FormGroup[label="Project Base Path"]').length).toBe(1);
+    expect(wrapper.find('FormGroup[label="Playbook Directory"]').length).toBe(
+      1
+    );
+  });
+
+  test('manual subform should display warning message when playbook directory is empty', async () => {
+    const config = {
+      project_local_paths: [],
+      project_base_dir: 'dir/foo/bar',
+    };
+    await act(async () => {
+      wrapper = mountWithContexts(
+        <ProjectForm
+          handleSubmit={jest.fn()}
+          handleCancel={jest.fn()}
+          project={{ scm_type: '', local_path: '' }}
+        />,
+        {
+          context: { config },
+        }
+      );
+    });
+    await waitForElement(wrapper, 'ContentLoading', el => el.length === 0);
+    expect(wrapper.find('ManualSubForm Alert').length).toBe(1);
   });
 
   test('should reset scm subform values when scm type changes', async () => {

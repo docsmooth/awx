@@ -175,3 +175,57 @@ export const Job = shape({
   extra_vars: string,
   artifacts: shape({}),
 });
+
+export const Host = shape({
+  id: number.isRequired,
+  type: oneOf(['host']),
+  url: string,
+  related: shape(),
+  summary_fields: shape({
+    inventory: Inventory,
+    last_job: Job,
+    last_job_host_summary: shape({}),
+    created_by: shape({}),
+    modified_by: shape({}),
+    user_capabilities: objectOf(bool),
+    groups: shape({}),
+    recent_jobs: arrayOf(Job),
+  }),
+  created: string,
+  modified: string,
+  name: string.isRequired,
+  description: string,
+  inventory: number.isRequired,
+  enabled: bool,
+  instance_id: string,
+  variables: string,
+  has_active_failures: bool,
+  has_inventory_sources: bool,
+  last_job: number,
+  last_job_host_summary: number,
+});
+
+export const Team = shape({
+  id: number.isRequired,
+  name: string.isRequired,
+  organization: number,
+});
+
+export const User = shape({
+  id: number.isRequired,
+  type: oneOf(['user']),
+  url: string,
+  related: shape(),
+  summary_fields: shape({
+    user_capabilities: objectOf(bool),
+  }),
+  created: string,
+  username: string,
+  first_name: string,
+  last_name: string,
+  email: string.isRequired,
+  is_superuser: bool,
+  is_system_auditor: bool,
+  ldap_dn: string,
+  last_login: string,
+});
